@@ -1,12 +1,12 @@
 /*
- * embed_mpi.c - sentence embeddings with a BERT encoder (all-MiniLM-L6-v2),
- * in plain C, with the layers split across MPI ranks (pipeline parallelism).
+ * embed_mpi.c - sentence embeddings with a BERT encoder (all-MiniLM-L6-v2 or
+ * bge-base-en-v1.5), in plain C, with the layers split across MPI ranks (pipeline parallelism).
  *
  * Who does what, for one text:
  *
  *   rank 0        tokenize, embeddings, its layers --> send x to rank 1
  *   rank 1..N-2   recv x, run its layers           --> send x to the next rank
- *   rank N-1      recv x, run its layers, average and normalize
+ *   rank N-1      recv x, run its layers, make and normalize the vector
  *                                                  --> send the vector to rank 0
  *
  * Texts don't depend on each other, so rank 0 starts the next text without
@@ -15,6 +15,7 @@
  * Build:  mpicc -std=gnu99 -O3 -ffast-math -o embed_mpi embed_mpi.c -lm
  * Index:  mpirun -np 2 ./embed_mpi minilm.bin vocab.txt -f texts.txt -o vectors.bin
  * Search: mpirun -np 2 ./embed_mpi minilm.bin vocab.txt -f texts.txt -v vectors.bin -q "a question"
+ * Live:   add -t 1 to see what every rank works on and what it sends
  */
 
 #define _GNU_SOURCE
@@ -29,7 +30,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#define MAGIC 0x4d424544 // file header marker, written by export_minilm.py
+#define MAGIC_MEAN 0x4d424544 // written by export_minilm.py: the vector is the average of the tokens
+#define MAGIC_CLS  0x4d424543 // written by export_bge.py: the vector is the [CLS] token
 #define TAG_STOP 0
 #define TAG_DATA 1
 
@@ -100,7 +102,7 @@ static void load_model(Model* m, const char* path, int first_layer, int n_local,
     if (m->map == MAP_FAILED) die("mmap failed");
     close(fd);
     memcpy(&m->c, m->map, sizeof(Config));
-    if (m->c.magic != MAGIC) die("this is not a file made by export_minilm.py");
+    if (m->c.magic != MAGIC_MEAN && m->c.magic != MAGIC_CLS) die("this is not a file made by the export scripts");
 
     Config* c = &m->c;
     long long d = c->dim, h = c->hidden_dim;
@@ -455,14 +457,17 @@ static void forward_layers(Model* m, float* x, int n) {
     }
 }
 
-// Last rank: average over the tokens, then scale the vector to length 1.
-static void pool_and_normalize(const float* x, int n, int d, float* out) {
+// Last rank: average the tokens, or take the first one ([CLS]) if the model asks
+// for that. Then scale the vector to length 1.
+static void pool_and_normalize(const Model* m, const float* x, int n, float* out) {
+    int d = m->c.dim;
+    int used = m->c.magic == MAGIC_CLS ? 1 : n;
     double* sum = xcalloc(d, sizeof(double));
-    for (int t = 0; t < n; t++) {
+    for (int t = 0; t < used; t++) {
         for (int i = 0; i < d; i++) sum[i] += x[(size_t)t * d + i];
     }
     double norm = 0.0;
-    for (int i = 0; i < d; i++) { sum[i] /= n; norm += sum[i] * sum[i]; }
+    for (int i = 0; i < d; i++) { sum[i] /= used; norm += sum[i] * sum[i]; }
     norm = sqrt(norm);
     if (norm < 1e-12) norm = 1e-12;
     for (int i = 0; i < d; i++) out[i] = (float)(sum[i] / norm);
@@ -476,6 +481,28 @@ static double t_compute = 0.0; // time spent on the model and the tokenizer
 static double t_comm = 0.0;    // time inside MPI calls: transfer plus waiting for data
 static long long g_tokens = 0;
 
+// Live view (-t 1): every rank prints what it works on, from when to when, and what it sends.
+static int g_trace = 0;
+static double g_start = 0.0;
+static char g_host[MPI_MAX_PROCESSOR_NAME];
+
+static void trace_work(const Model* m, int text, int tokens, double t0, double t1, int dest, double kb) {
+    char layers[32];
+    if (m->n_local > 0) sprintf(layers, "%d-%d", m->first_layer, m->first_layer + m->n_local - 1);
+    else sprintf(layers, "none");
+    fprintf(stderr, "[%8.3f - %8.3f s] rank %d %s | text %d | %d tokens | layers %s | %.1f ms",
+            t0 - g_start, t1 - g_start, g_rank, g_host, text, tokens, layers, (t1 - t0) * 1000);
+    if (dest >= 0) fprintf(stderr, " | sends %.1f KB to rank %d", kb, dest);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+static void trace_received(int text) {
+    fprintf(stderr, "[%8.3f s] rank %d %s | text %d | final vector received\n",
+            MPI_Wtime() - g_start, g_rank, g_host, text);
+    fflush(stderr);
+}
+
 // Rank 0: if a finished vector has arrived, store it. Results come back in the
 // same order the texts went in, because every rank handles them one at a time.
 static int try_receive(float* out, int d, int size, int* done) {
@@ -483,6 +510,7 @@ static int try_receive(float* out, int d, int size, int* done) {
     MPI_Iprobe(size - 1, TAG_DATA, MPI_COMM_WORLD, &flag, MPI_STATUS_IGNORE);
     if (flag) {
         MPI_Recv(out + (size_t)(*done) * d, d, MPI_FLOAT, size - 1, TAG_DATA, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (g_trace) trace_received(*done);
         (*done)++;
     }
     return flag;
@@ -502,8 +530,10 @@ static void embed_batch(Model* m, const Vocab* v, char** texts, int n, float* ou
             embed_tokens(m, ids, len, x);
             forward_layers(m, x, len);
             g_tokens += len;
-            if (size == 1) pool_and_normalize(x, len, d, out + (size_t)next * d);
-            t_compute += MPI_Wtime() - t0;
+            if (size == 1) pool_and_normalize(m, x, len, out + (size_t)next * d);
+            double t1 = MPI_Wtime();
+            t_compute += t1 - t0;
+            if (g_trace) trace_work(m, next, len, t0, t1, size == 1 ? -1 : 1, len * d * sizeof(float) / 1024.0);
             next++;
             if (size == 1) { done++; continue; }
 
@@ -521,6 +551,7 @@ static void embed_batch(Model* m, const Vocab* v, char** texts, int n, float* ou
         } else {
             double t0 = MPI_Wtime();
             MPI_Recv(out + (size_t)done * d, d, MPI_FLOAT, size - 1, TAG_DATA, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            if (g_trace) trace_received(done);
             done++;
             t_comm += MPI_Wtime() - t0;
         }
@@ -534,6 +565,7 @@ static void run_worker(Model* m, int rank, int size) {
     int d = m->c.dim;
     float* x = xcalloc((size_t)m->max_len * d, sizeof(float));
     float* vec = xcalloc(d, sizeof(float));
+    int text = 0; // texts arrive in order, so counting them gives their number
     for (;;) {
         MPI_Status st;
         int count;
@@ -549,8 +581,14 @@ static void run_worker(Model* m, int rank, int size) {
 
         t0 = MPI_Wtime();
         forward_layers(m, x, n);
-        if (rank == size - 1) pool_and_normalize(x, n, d, vec);
-        t_compute += MPI_Wtime() - t0;
+        if (rank == size - 1) pool_and_normalize(m, x, n, vec);
+        double t1 = MPI_Wtime();
+        t_compute += t1 - t0;
+        if (g_trace) {
+            int last = rank == size - 1;
+            trace_work(m, text, n, t0, t1, last ? 0 : rank + 1, (last ? d : n * d) * sizeof(float) / 1024.0);
+        }
+        text++;
 
         t0 = MPI_Wtime();
         if (rank == size - 1) MPI_Send(vec, d, MPI_FLOAT, 0, TAG_DATA, MPI_COMM_WORLD);
@@ -630,6 +668,15 @@ static char** read_lines(const char* path, int* count) {
     return lines;
 }
 
+// The question with the model's recommended prefix in front, if it has one.
+static char* with_prefix(const char* prefix, const char* text) {
+    size_t a = prefix ? strlen(prefix) : 0, b = strlen(text);
+    char* out = xcalloc(a + b + 2, 1);
+    if (a > 0) { memcpy(out, prefix, a); out[a] = ' '; a++; }
+    memcpy(out + a, text, b);
+    return out;
+}
+
 static void print_matches(const float* query, const float* vectors, char** texts, int n, int d, int top_k) {
     int* best = xcalloc(top_k, sizeof(int));
     float* score = xcalloc(top_k, sizeof(float));
@@ -665,6 +712,8 @@ static void error_usage(void) {
         fprintf(stderr, "  -l <list>   layers per rank, e.g. 3,3. Default: even split\n");
         fprintf(stderr, "  -w <int>    most texts in the pipeline at once, default 2 x ranks\n");
         fprintf(stderr, "  -m <int>    most tokens per text, default 256\n");
+        fprintf(stderr, "  -p <text>   search mode: prefix added in front of every question\n");
+        fprintf(stderr, "  -t 1        live view: every rank prints what it works on and what it sends\n");
     }
     MPI_Abort(MPI_COMM_WORLD, 1);
     exit(EXIT_FAILURE);
@@ -697,7 +746,7 @@ int main(int argc, char* argv[]) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     g_rank = rank;
 
-    char *texts_path = NULL, *out_path = NULL, *ref_path = NULL, *vec_path = NULL, *query = NULL, *split = NULL;
+    char *texts_path = NULL, *out_path = NULL, *ref_path = NULL, *vec_path = NULL, *query = NULL, *split = NULL, *prefix = NULL;
     int top_k = 5, window = 2 * size, max_len = 256;
 
     if (argc < 3) error_usage();
@@ -716,6 +765,8 @@ int main(int argc, char* argv[]) {
             case 'l': split = val; break;
             case 'w': window = atoi(val); break;
             case 'm': max_len = atoi(val); break;
+            case 'p': prefix = val; break;
+            case 't': g_trace = atoi(val); break;
             default: error_usage();
         }
     }
@@ -729,7 +780,7 @@ int main(int argc, char* argv[]) {
     FILE* cf = fopen(model_path, "rb");
     if (!cf || fread(&head, sizeof(Config), 1, cf) != 1) die("can't read the model file");
     fclose(cf);
-    if (head.magic != MAGIC) die("this is not a file made by export_minilm.py");
+    if (head.magic != MAGIC_MEAN && head.magic != MAGIC_CLS) die("this is not a file made by the export scripts");
     if (max_len < 3 || max_len > head.max_pos) die("-m is out of range");
 
     int* counts = xcalloc(size, sizeof(int));
@@ -745,9 +796,11 @@ int main(int argc, char* argv[]) {
     int hostname_len;
     memset(hostname, 0, sizeof(hostname));
     MPI_Get_processor_name(hostname, &hostname_len);
+    memcpy(g_host, hostname, sizeof(g_host));
 
     double latency = measure_latency(d, rank, size);
     MPI_Barrier(MPI_COMM_WORLD);
+    g_start = MPI_Wtime();
 
     double wall = 0.0;
     int n_texts = 0;
@@ -805,7 +858,9 @@ int main(int argc, char* argv[]) {
                     while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
                     if (l == 0) break;
                     double t0 = MPI_Wtime();
-                    embed_batch(&model, &vocab, &line, 1, q_vec, 1, size);
+                    char* full = with_prefix(prefix, line);
+                    embed_batch(&model, &vocab, &full, 1, q_vec, 1, size);
+                    free(full);
                     double t1 = MPI_Wtime();
                     print_matches(q_vec, vectors, texts, n_texts, d, top_k);
                     printf("  (%.1f ms to embed, %.1f ms to search)\n", (t1 - t0) * 1000, (MPI_Wtime() - t1) * 1000);
@@ -814,7 +869,9 @@ int main(int argc, char* argv[]) {
                 free(line);
             } else {
                 double t0 = MPI_Wtime();
-                embed_batch(&model, &vocab, &query, 1, q_vec, 1, size);
+                char* full = with_prefix(prefix, query);
+                embed_batch(&model, &vocab, &full, 1, q_vec, 1, size);
+                free(full);
                 double t1 = MPI_Wtime();
                 print_matches(q_vec, vectors, texts, n_texts, d, top_k);
                 printf("  (%.1f ms to embed, %.1f ms to search)\n", (t1 - t0) * 1000, (MPI_Wtime() - t1) * 1000);
