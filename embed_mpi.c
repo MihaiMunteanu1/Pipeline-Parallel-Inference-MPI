@@ -484,16 +484,18 @@ static long long g_tokens = 0;
 // Live view (-t 1): every rank prints what it works on, from when to when, and what it sends.
 static int g_trace = 0;
 static double g_start = 0.0;
+static int g_text_base = 0; // texts finished in earlier batches, so numbers keep growing
 static char g_host[MPI_MAX_PROCESSOR_NAME];
 
 static void trace_work(const Model* m, int text, int tokens, double t0, double t1, int dest, double kb) {
     char layers[32];
     if (m->n_local > 0) sprintf(layers, "%d-%d", m->first_layer, m->first_layer + m->n_local - 1);
     else sprintf(layers, "none");
-    fprintf(stderr, "[%8.3f - %8.3f s] rank %d %s | text %d | %d tokens | layers %s | %.1f ms",
-            t0 - g_start, t1 - g_start, g_rank, g_host, text, tokens, layers, (t1 - t0) * 1000);
-    if (dest >= 0) fprintf(stderr, " | sends %.1f KB to rank %d", kb, dest);
-    fprintf(stderr, "\n");
+    char sends[64] = "";
+    if (dest >= 0) sprintf(sends, " | sends %.1f KB to rank %d", kb, dest);
+    // one single print, so that lines from different ranks don't get mixed
+    fprintf(stderr, "[%8.3f - %8.3f s] rank %d %s | text %d | %d tokens | layers %s | %.1f ms%s\n",
+            t0 - g_start, t1 - g_start, g_rank, g_host, text, tokens, layers, (t1 - t0) * 1000, sends);
     fflush(stderr);
 }
 
@@ -510,7 +512,7 @@ static int try_receive(float* out, int d, int size, int* done) {
     MPI_Iprobe(size - 1, TAG_DATA, MPI_COMM_WORLD, &flag, MPI_STATUS_IGNORE);
     if (flag) {
         MPI_Recv(out + (size_t)(*done) * d, d, MPI_FLOAT, size - 1, TAG_DATA, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        if (g_trace) trace_received(*done);
+        if (g_trace) trace_received(g_text_base + *done);
         (*done)++;
     }
     return flag;
@@ -533,7 +535,7 @@ static void embed_batch(Model* m, const Vocab* v, char** texts, int n, float* ou
             if (size == 1) pool_and_normalize(m, x, len, out + (size_t)next * d);
             double t1 = MPI_Wtime();
             t_compute += t1 - t0;
-            if (g_trace) trace_work(m, next, len, t0, t1, size == 1 ? -1 : 1, len * d * sizeof(float) / 1024.0);
+            if (g_trace) trace_work(m, g_text_base + next, len, t0, t1, size == 1 ? -1 : 1, len * d * sizeof(float) / 1024.0);
             next++;
             if (size == 1) { done++; continue; }
 
@@ -551,11 +553,12 @@ static void embed_batch(Model* m, const Vocab* v, char** texts, int n, float* ou
         } else {
             double t0 = MPI_Wtime();
             MPI_Recv(out + (size_t)done * d, d, MPI_FLOAT, size - 1, TAG_DATA, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            if (g_trace) trace_received(done);
+            if (g_trace) trace_received(g_text_base + done);
             done++;
             t_comm += MPI_Wtime() - t0;
         }
     }
+    g_text_base += n;
     free(x);
     free(ids);
 }
